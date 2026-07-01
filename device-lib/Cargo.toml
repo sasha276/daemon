@@ -1,0 +1,15 @@
+[package]
+name    = "device-lib"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "device_lib"
+
+[dependencies]
+tokio       = { workspace = true }
+thiserror   = { workspace = true }
+async-trait = { workspace = true }
+tracing     = { workspace = true }
+nusb        = { workspace = true }
+futures-lite = { workspace = true }

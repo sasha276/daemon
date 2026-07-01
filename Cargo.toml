@@ -1,0 +1,23 @@
+[workspace]
+members = [
+    "device-lib",
+    "appd",
+]
+resolver = "2"
+
+[workspace.dependencies]
+tokio              = { version = "=1.38.0", features = ["full"] }
+thiserror          = "=1.0.58"
+async-trait        = "=0.1.77"
+tracing            = "=0.1.40"
+tracing-subscriber = { version = "=0.3.18", features = ["env-filter"] }
+serde              = { version = "=1.0.197", features = ["derive"] }
+serde_json         = "=1.0.114"
+dashmap            = "=5.5.3"
+rusb               = "=0.9.4"
+futures-lite = "2"
+nusb = { version = "0.2.3", features = ["tokio"] }
+
+[profile.release]
+opt-level = 3
+strip     = true
