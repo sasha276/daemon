@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 
 use nusb::MaybeFuture;
@@ -15,7 +16,8 @@ const BCD_APPI2M: u16 = 0x7300;
 const PHLOX_VID:u16=0x16C0;
 const PHLOX_PID:u16=0x05DC;
 
-/// К какому драйверу относится найденное устройство.
+const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Clone, Copy)]
 enum DeviceKind {
     Appi,
@@ -35,11 +37,8 @@ enum DeviceKind {
 /// освободиться и отсеивался.
 pub struct DeviceHandle {
     pub info: DeviceInfo,
-    /// Сохранённое описание конкретного физического прибора для ленивого open.
     raw: nusb::DeviceInfo,
     kind: DeviceKind,
-
-    /// Кеш открытого драйвера (открывается при первом обращении).
     driver: Option<Arc<dyn Device>>,
 }
 
@@ -60,9 +59,6 @@ impl DeviceManager {
     /// чтобы не рвать активные сессии при каждом refresh.
     pub async fn refresh(&self) {
         let mut list = self.devices.write().await;
-
-        // Забираем прежние открытые драйверы, чтобы переиспользовать их для
-        // приборов, оставшихся на тех же физических портах.
         let mut old: Vec<DeviceHandle> = std::mem::take(&mut *list);
 
         let device_list = match nusb::list_devices().wait() {
@@ -73,21 +69,7 @@ impl DeviceManager {
             }
         };
 
-        // Диагностика: материализуем список и считаем, сколько приборов с нашим
-        // VID:PID реально видит ОС. Если здесь 1 при двух подключённых — проблема
-        // не в коде, а в драйвере/хабе/композитном устройстве на стороне ОС.
         let all: Vec<nusb::DeviceInfo> = device_list.collect();
-        /*let matching = all
-            .iter()
-            .filter(|d| d.vendor_id() == APPI_VID && d.product_id() == APPI_PID)
-            .count();
-        tracing::info!(
-            "enumerate: {} usb device(s) total, {} with VID:PID {:04X}:{:04X}",
-            all.len(),
-            matching,
-            APPI_VID,
-            APPI_PID
-        );*/
 
         tracing::info!("enumerate: {} usb device(s) total", all.len());
 
@@ -106,8 +88,6 @@ impl DeviceManager {
 
             let bcd_raw = info.device_version();
 
-            // bus + port уникальны для каждого физического прибора, даже когда
-            // VID/PID/serial совпадают. По ним и различаем устройства.
             let id_bus = info.device_address();
             let id_port = info
                 .port_chain()
@@ -138,8 +118,6 @@ impl DeviceManager {
                 product: product_name,
             };
 
-            // Если этот же прибор уже был открыт в прошлый раз (тот же bus+port),
-            // переносим живой драйвер — не дёргаем USB и не рвём сессию.
             let reused = old
                 .iter()
                 .position(|h| h.info.id.bus == id_bus && h.info.id.port == id_port)
@@ -174,10 +152,7 @@ impl DeviceManager {
             .collect()
     }
 
-    /// Возвращает драйвер устройства по индексу, открывая его при первом
-    /// обращении (ленивое открытие) и кешируя результат.
     pub async fn get_driver(&self, idx: usize) -> Result<Arc<dyn Device>, DeviceError> {
-        // Быстрый путь: драйвер уже открыт.
         {
             let list = self.devices.read().await;
             let h = list.get(idx).ok_or(DeviceError::NotFound)?;
@@ -194,12 +169,20 @@ impl DeviceManager {
         }
 
         let raw = h.raw.clone();
-        let device = raw.open().wait().map_err(DeviceError::from)?;
+        let device = tokio::time::timeout(OPEN_TIMEOUT, async { raw.open().await })
+            .await
+            .map_err(|_| DeviceError::Timeout)?
+            .map_err(DeviceError::from)?;
         let driver: Arc<dyn Device> = match h.kind {
             DeviceKind::Appi2M => Arc::new(Appi2::open(device, Appi2Variant::Appi2M)?),
             DeviceKind::Appi2 => Arc::new(Appi2::open(device, Appi2Variant::Appi2)?),
             DeviceKind::Appi => Arc::new(Appi::open(device)?),
-            DeviceKind::Phlox => Arc::new(Phlox::open(device)?),
+            DeviceKind::Phlox => {
+                let phlox = tokio::time::timeout(OPEN_TIMEOUT, Phlox::open(device))
+                    .await
+                    .map_err(|_| DeviceError::Timeout)??;
+                Arc::new(phlox)
+            }
         };
         h.driver = Some(driver.clone());
         Ok(driver)
@@ -210,33 +193,9 @@ impl DeviceManager {
     }
 }
 
-/// Определяет, какой драйвер использовать для конкретной железки.
-///
-/// Все устройства с VID:PID 1992:1972 — это семейство АППИ, и по
-/// USB-протоколу они общаются одинаково. Различия между моделями
-/// (АППИ / АППИ-2 / АППИ-2М) — это вопрос того, какие физические
-/// интерфейсы реально выведены наружу (UART/RS-485 могут отсутствовать
-/// на самой ранней АППИ), но программно мы это узнаём только по
-/// фактическому ответу устройства, а не по дескриптору.
-///
-/// Поэтому стратегия простая: **по умолчанию выбираем `Appi2`** —
-/// полнофункциональный драйвер (CAN + UART + Gen). Если у конкретной
-/// железки чего-то нет, мы получим обычную USB-ошибку при попытке
-/// использовать, а не отрезаем функционал заранее.
-///
-/// `Appi2M` распознаётся явно по bcd=0x7300 — это единственный
-/// надёжный признак из прошивки, который мы видели на парте устройств.
-/// Для других bcd / product мы НЕ пытаемся угадать модель: считаем,
-/// что это всё равно АППИ-2 — функционально идентично для нас.
 fn classify_appi(bcd_raw: u16) -> DeviceKind {
     if bcd_raw == BCD_APPI2M {
         return DeviceKind::Appi2M;
     }
-    // Всё остальное — Appi2. Сюда попадают:
-    //  - АППИ-2М с прошивкой, где bcd != 0x7300 (видели bcd=0x0000 и 0x0100);
-    //  - АППИ-2 со штатной прошивкой;
-    //  - теоретическая АППИ-1, если такая физически встретится — у неё
-    //    может не работать UART, тогда команда выдаст USB-ошибку, что
-    //    честнее, чем заранее скрывать возможность от пользователя.
     DeviceKind::Appi2
 }

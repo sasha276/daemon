@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use nusb::descriptors::TransferType;
 use nusb::transfer::{Bulk, Buffer, Direction, In, Out};
-use nusb::{Interface, MaybeFuture};
+use nusb::{Interface};
 
 use crate::devices::phlox_common as pc;
 use crate::error::DeviceError;
@@ -55,18 +55,22 @@ unsafe impl Sync for Phlox {}
 
 impl Phlox {
     /// Открывает драйвер на уже открытом устройстве `nusb::Device`.
-    pub fn open(device: nusb::Device) -> Result<Self, DeviceError> {
+    pub async fn open(device: nusb::Device) -> Result<Self, DeviceError> {
+        tracing::info!("Phlox: захватываю интерфейс {DEFAULT_INTERFACE}");
+
         #[cfg(target_os = "linux")]
         let iface = device
             .detach_and_claim_interface(DEFAULT_INTERFACE)
-            .wait()
+            .await
             .map_err(DeviceError::from)?;
 
         #[cfg(not(target_os = "linux"))]
         let iface = device
             .claim_interface(DEFAULT_INTERFACE)
-            .wait()
+            .await
             .map_err(DeviceError::from)?;
+
+        tracing::info!("Phlox: интерфейс {DEFAULT_INTERFACE} захвачен, ищу bulk-эндпоинты");
 
         let (write_ep, read_ep) = discover_bulk_endpoints(&iface)?;
         tracing::info!("Phlox: интерфейс {DEFAULT_INTERFACE}, OUT=0x{write_ep:02X} IN=0x{read_ep:02X}");
