@@ -154,12 +154,16 @@ impl DeviceManager {
 
     pub async fn get_driver(&self, idx: usize) -> Result<Arc<dyn Device>, DeviceError> {
         {
-            let list = self.devices.read().await;
-            let h = list.get(idx).ok_or(DeviceError::NotFound)?;
+            tracing::info!("Проверка дохода в метод get_driver");
+
+            let list = self.devices.read().await;//Весь список устройств
+            let h = list.get(idx).ok_or(DeviceError::NotFound)?;//Получение нужного устройства
             if let Some(d) = &h.driver {
                 return Ok(d.clone());
             }
         }
+
+        tracing::info!("Проверка дохода в метод get_driver __1");
 
         // Медленный путь: открываем под write-локом.
         let mut list = self.devices.write().await;
@@ -168,11 +172,19 @@ impl DeviceManager {
             return Ok(d.clone());
         }
 
+        tracing::info!("Проверка дохода в метод get_driver __2");
+
         let raw = h.raw.clone();
+
+        tracing::info!("Проверка дохода в метод get_driver __3");
+
         let device = tokio::time::timeout(OPEN_TIMEOUT, async { raw.open().await })
             .await
             .map_err(|_| DeviceError::Timeout)?
             .map_err(DeviceError::from)?;
+
+        tracing::info!("Проверка дохода в метод get_driver __4");
+
         let driver: Arc<dyn Device> = match h.kind {
             DeviceKind::Appi2M => Arc::new(Appi2::open(device, Appi2Variant::Appi2M)?),
             DeviceKind::Appi2 => Arc::new(Appi2::open(device, Appi2Variant::Appi2)?),
@@ -184,10 +196,14 @@ impl DeviceManager {
                 Arc::new(phlox)
             }
         };
+
+        tracing::info!("Проверка дохода в метод get_driver __5");
+
         h.driver = Some(driver.clone());
         Ok(driver)
     }
 
+    
     pub async fn get_info(&self, idx: usize) -> Option<DeviceInfo> {
         self.devices.read().await.get(idx).map(|h| h.info.clone())
     }

@@ -257,10 +257,16 @@ async fn process(
             Packet::response(packet, &p)
         }
 
-        // ── device commands ───────────────────────────────────────────────
+        // device commands
 
         Cmd::GetVersion => {
+
+            tracing::info!("Проверка дохода в метод Cmd::GetVersion");
+
             let sess = sessions.get(packet.session_id)?;
+
+            tracing::info!("Проверка после получеиня сессии");
+
             match devices.get_driver(sess.device_idx).await {
                 Ok(d) => match d.get_version().await {
                     Ok(ver) => Packet::response(packet, ver.as_bytes()),

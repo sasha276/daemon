@@ -66,8 +66,8 @@ pub struct Frame {
 /// Собирает кадр `ID|len(2, BE)|CRC8|data` для отправки в устройство.
 pub fn encode_frame(module_id: u8, data: &[u8]) -> Vec<u8> {
     let len = data.len() as u16;
-    let len_be = len.to_be_bytes();
-    let header = [module_id, len_be[0], len_be[1]];
+    let len_le = len.to_le_bytes();
+    let header = [module_id, len_le[0], len_le[1]];
     let crc = crc8(&header);
 
     let mut out = Vec::with_capacity(4 + data.len());
@@ -93,7 +93,7 @@ pub fn find_frame(buf: &[u8]) -> Option<(Frame, usize)> {
         if crc8(header) != crc {
             continue;
         }
-        let len = u16::from_be_bytes([header[1], header[2]]) as usize;
+        let len = u16::from_le_bytes([header[1], header[2]]) as usize;
         let end = start + 4 + len;
         if end > buf.len() {
             // Заголовок похож на валидный, но данных ещё не хватает —
@@ -109,7 +109,7 @@ pub fn find_frame(buf: &[u8]) -> Option<(Frame, usize)> {
     None
 }
 
-// ── Master: Start / Device Info ─────────────────────────────────────────────
+// ── Master: Start / Device Info
 
 /// Кадр запроса "Start" в модуль Master.
 pub fn start_frame(rid: u8) -> Vec<u8> {

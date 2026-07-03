@@ -53,9 +53,40 @@ pub struct Phlox {
 unsafe impl Send for Phlox {}
 unsafe impl Sync for Phlox {}
 
+fn log_configuration(device: &nusb::Device) {
+    let cfg = match device.active_configuration() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            tracing::warn!("Phlox: не удалось прочитать active_configuration: {e}");
+            return;
+        }
+    };
+    for iface in cfg.interfaces() {
+        for alt in iface.alt_settings() {
+            let eps: Vec<String> = alt
+                .endpoints()
+                .map(|e| {
+                    format!(
+                        "{:?} addr=0x{:02X} type={:?} max_packet={}",
+                        e.direction(), e.address(), e.transfer_type(), e.max_packet_size()
+                    )
+                })
+                .collect();
+            tracing::info!(
+                "Phlox: конфигурация — интерфейс {} alt={} class=0x{:02X} sub=0x{:02X} proto=0x{:02X} эндпоинты={:?}",
+                alt.interface_number(), alt.alternate_setting(),
+                alt.class(), alt.subclass(), alt.protocol(), eps
+            );
+        }
+    }
+}
+
 impl Phlox {
     /// Открывает драйвер на уже открытом устройстве `nusb::Device`.
     pub async fn open(device: nusb::Device) -> Result<Self, DeviceError> {
+
+        log_configuration(&device);
+
         tracing::info!("Phlox: захватываю интерфейс {DEFAULT_INTERFACE}");
 
         #[cfg(target_os = "linux")]
@@ -84,12 +115,17 @@ impl Phlox {
     }
 
     async fn usb_write(&self, data: &[u8]) -> Result<(), DeviceError> {
+        tracing::info!(
+        "Phlox: usb_write: отправляю {} байт на EP=0x{:02X}: {}",
+        data.len(), self.write_ep, hex_dump(data)
+    );
         let mut ep = self
             .iface
             .endpoint::<Bulk, Out>(self.write_ep)
             .map_err(|e| DeviceError::Usb(e.to_string()))?;
         ep.submit(data.to_vec().into());
         ep.next_complete().await.into_result().map_err(DeviceError::from)?;
+        tracing::info!("Phlox: usb_write: OUT-транзакция подтверждена железом");
         Ok(())
     }
 
@@ -99,57 +135,108 @@ impl Phlox {
             .endpoint::<Bulk, In>(self.read_ep)
             .map_err(|e| DeviceError::Usb(e.to_string()))?;
         ep.submit(Buffer::new(READ_CHUNK));
+
         let data = ep.next_complete().await.into_result().map_err(DeviceError::from)?;
         Ok(data.to_vec())
     }
-
-    /// Читает и возвращает следующий валидный кадр из потока, ожидая новые
-    /// данные из USB, пока в накопленном буфере нет полного кадра.
+    
     async fn read_frame(&self, deadline: Instant) -> Result<pc::Frame, DeviceError> {
+        tracing::info!("Phlox: read_frame: вход");
         loop {
             {
+                tracing::info!("Phlox: read_frame: 1");
                 let mut st = self.state.lock().unwrap();
                 if let Some((frame, consumed)) = pc::find_frame(&st.rx_buf) {
                     st.rx_buf.drain(..consumed);
+                    tracing::info!(
+                    "Phlox: read_frame: разобран кадр module_id={} data={}",
+                    frame.module_id,
+                    hex_dump(&frame.data)
+                );
                     return Ok(frame);
                 }
             }
-            if Instant::now() >= deadline {
+            tracing::info!("Phlox: read_frame: 2");
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                let left = self.state.lock().unwrap().rx_buf.len();
+                tracing::warn!(
+                "Phlox: read_frame: таймаут, в буфере остались непонятые {left} байт(а)"
+            );
                 return Err(DeviceError::Timeout);
             }
-            let chunk = self.usb_read_chunk().await?;
+
+            tracing::info!("Phlox: read_frame: 3");
+            let chunk = match tokio::time::timeout(remaining, self.usb_read_chunk()).await {
+                Ok(res) => res?,
+                Err(_) => {
+                    let left = self.state.lock().unwrap().rx_buf.len();
+                    tracing::warn!(
+                    "Phlox: read_frame: таймаут ожидания данных с USB (устройство молчит), \
+                     в буфере {left} байт(а)"
+                );
+                    return Err(DeviceError::Timeout);
+                }
+            };
             if chunk.is_empty() {
                 continue;
             }
-            self.state.lock().unwrap().rx_buf.extend_from_slice(&chunk);
+            tracing::info!(
+            "Phlox: read_frame: получено {} байт с USB: {}",
+            chunk.len(),
+            hex_dump(&chunk)
+        );
+            let mut st = self.state.lock().unwrap();
+            st.rx_buf.extend_from_slice(&chunk);
+            tracing::info!(
+            "Phlox: read_frame: буфер после накопления ({} байт): {}",
+            st.rx_buf.len(),
+            hex_dump(&st.rx_buf)
+        );
         }
     }
 
-    /// Рукопожатие Master: отправляет Start(rid) и ждёт Device Info с тем же
-    /// rid, отбрасывая по пути любые другие кадры (например, от CAN/UART,
-    /// если устройство уже что-то принимает).
+
     async fn handshake(&self) -> Result<pc::DeviceInfoMsg, DeviceError> {
+
+
         let rid = {
             let mut st = self.state.lock().unwrap();
             st.next_rid = st.next_rid.wrapping_add(1);
             st.next_rid
         };
+        tracing::info!("Проверка handshake ___1");
+
 
         self.usb_write(&pc::start_frame(rid)).await?;
+
+        tracing::info!("Проверка handshake ___2");
 
         let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
         loop {
             let frame = self.read_frame(deadline).await?;
+            tracing::info!("чтение метод handshake");
             if frame.module_id != pc::MODULE_MASTER {
                 continue;
             }
             match pc::parse_device_info(&frame.data) {
                 Ok(info) if info.rid == rid => return Ok(info),
-                Ok(_) => continue, // Device Info от другого запроса — не наш rid
-                Err(_) => continue, // не Device Info (другой Type) — пропускаем
+                Ok(_) => continue,
+                Err(_) => continue,
             }
         }
     }
+}
+
+fn hex_dump(data: &[u8]) -> String {
+    const LIMIT: usize = 64;
+    let shown = &data[..data.len().min(LIMIT)];
+    let mut s: String = shown.iter().map(|b| format!("{b:02X} ")).collect();
+    if data.len() > LIMIT {
+        s.push_str(&format!("... (+{} байт)", data.len() - LIMIT));
+    }
+    s
 }
 
 #[async_trait]
@@ -181,10 +268,6 @@ impl Device for Phlox {
     }
 }
 
-/// Определяет bulk IN/OUT эндпоинты активного alt-setting интерфейса.
-///
-/// VID:PID Phlox не даёт готовых констант эндпоинтов (в отличие от АППИ),
-/// поэтому ищем их в дескрипторе интерфейса вместо того, чтобы угадывать.
 fn discover_bulk_endpoints(iface: &Interface) -> Result<(u8, u8), DeviceError> {
     let desc = iface
         .descriptor()
@@ -201,6 +284,7 @@ fn discover_bulk_endpoints(iface: &Interface) -> Result<(u8, u8), DeviceError> {
             Direction::In if in_ep.is_none() => in_ep = Some(ep.address()),
             _ => {}
         }
+
     }
 
     match (out_ep, in_ep) {

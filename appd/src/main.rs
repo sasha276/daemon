@@ -14,7 +14,8 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_env("APPD_LOG")
-                .add_directive("appd=info".parse().unwrap()),
+                .add_directive("appd=info".parse().unwrap())
+                .add_directive("device_lib=info".parse().unwrap()),
         )
         .init();
 
