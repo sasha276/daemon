@@ -17,7 +17,7 @@ pub const HEADER_LEN: usize = 10;
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cmd {
-    // ── client management ──────────────────────────────────
+    // управление клиентами
     /// Register new client → responds with assigned client_id
     Register        = 0x0001,
     /// Unregister client, close all its sessions
@@ -25,13 +25,15 @@ pub enum Cmd {
     /// Ping / keepalive
     Ping            = 0x0003,
 
-    // ── device discovery ───────────────────────────────────
+    // обнаружение устройств
     /// List connected USB devices
     DeviceList      = 0x0010,
     /// Get info for a specific device by index
     DeviceInfo      = 0x0011,
+    /// Get firmware version by device index (no session needed)
+    DeviceGetVersion = 0x0012,
 
-    // ── session management ─────────────────────────────────
+    // управление сессиями
     /// Open a session on a device
     SessionCreate   = 0x0020,
     /// Close a session
@@ -39,13 +41,13 @@ pub enum Cmd {
     /// List active sessions for this client
     SessionList     = 0x0022,
 
-    // ── device commands (require session_id) ───────────────
+    // команды устройства (требуют session_id)
     /// Get firmware version
     GetVersion      = 0x0030,
     /// Check UART presence
     CheckUart       = 0x0031,
 
-    // ── CAN streaming ──────────────────────────────────────
+    // CAN-потоковая передача
     /// Open extra UDP stream port for CAN read/write
     /// Payload: data_port:u16 (port the client listens on)
     StreamOpen      = 0x0040,
@@ -63,7 +65,7 @@ pub enum Cmd {
     /// Response: count:u16 + repeated hex-line frames (len:u8 + bytes)
     CanReadOnce     = 0x0046,
 
-    // ── UART ───────────────────────────────────────────────
+    // UART
     /// Configure UART mode. Payload: mode:u8 (+ mode-specific bytes)
     UartConfigure   = 0x0060,
     /// Write to UART. Payload: data bytes
@@ -75,7 +77,7 @@ pub enum Cmd {
     /// Close UART read stream port
     UartStreamClose = 0x0064,
 
-    // ── signal generator ───────────────────────────────────
+    // генератор сигналов
     /// Full generator setup. Payload: see GenSettings layout below
     GenSetMode      = 0x0070,
     /// Set channel frequency. Payload: channel:u8 + frequency:u32
@@ -83,13 +85,13 @@ pub enum Cmd {
     /// Set channel amplitude. Payload: channel:u8 + amplitude:u16
     GenSetAmplitude = 0x0072,
 
-    // ── server → client only ───────────────────────────────
+    // только сервер → клиент
     /// Async CAN frame pushed to stream port
     CanFrame        = 0x0050,
     /// Async event / notification
     Event           = 0x00F0,
 
-    // ── error response ─────────────────────────────────────
+    // ответ об ошибке
     Error           = 0xFFFF,
 }
 
@@ -102,6 +104,7 @@ impl TryFrom<u16> for Cmd {
             0x0003 => Ok(Cmd::Ping),
             0x0010 => Ok(Cmd::DeviceList),
             0x0011 => Ok(Cmd::DeviceInfo),
+            0x0012 => Ok(Cmd::DeviceGetVersion),
             0x0020 => Ok(Cmd::SessionCreate),
             0x0021 => Ok(Cmd::SessionClose),
             0x0022 => Ok(Cmd::SessionList),
@@ -163,7 +166,7 @@ impl Packet {
     pub fn base_cmd(&self) -> u16     { self.cmd_raw & 0x7FFF }
     pub fn cmd(&self) -> Result<Cmd, AppError> { Cmd::try_from(self.base_cmd()) }
 
-    // ── builders ───────────────────────────────────────────
+    // сборка пакетов
 
     pub fn build_raw(client_id: u16, session_id: u16, seq: u16, cmd: u16, payload: &[u8]) -> Vec<u8> {
         let mut buf = Vec::with_capacity(HEADER_LEN + payload.len());
@@ -192,7 +195,7 @@ impl Packet {
     }
 }
 
-// ── payload helpers ────────────────────────────────────────────────────────
+// вспомогательные функции для работы с payload
 
 /// Read u8 from payload at offset
 pub fn read_u8(payload: &[u8], offset: usize) -> Result<u8, AppError> {

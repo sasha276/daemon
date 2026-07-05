@@ -5,7 +5,7 @@
 //! пакетами фиксированного размера. Набор модулей (CAN/UART/Gen) устройство
 //! сообщает само в ответе "Device Info" — здесь их количество не фиксировано
 //! заранее, как у АППИ, поэтому `CanCapability`/`UartCapability`/
-//! `GenCapability` для Phlox пока не реализованы (см. README задачи):
+//! `GenCapability` для Phlox пока не реализованы:
 //! этот файл делает только то, что нужно для первого подключения —
 //! рукопожатие Master (Start → Device Info) и чтение версии.
 //!
@@ -19,26 +19,19 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use nusb::descriptors::TransferType;
 use nusb::transfer::{Bulk, Buffer, Direction, In, Out};
-use nusb::{Interface};
+use nusb::Interface;
 
 use crate::devices::phlox_common as pc;
 use crate::error::DeviceError;
 use crate::traits::{CapabilitySet, Device};
 
-/// Интерфейс USB, который пробуем захватить по умолчанию.
-///
-/// Предположение до проверки на реальном железе: у Phlox одна bulk-пара
-/// эндпоинтов на интерфейсе 0. Если устройство композитное (несколько
-/// интерфейсов), стоит скорректировать при первом реальном подключении.
 const DEFAULT_INTERFACE: u8 = 0;
-
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const READ_CHUNK: usize = 512;
 
 #[derive(Default)]
 struct PhloxState {
-    /// Накопительный буфер входящего потока — кадр может быть разрезан
-    /// USB-транзакциями или несколько кадров прийти в одной.
+    // накопительный буфер: кадр может быть разрезан USB-транзакциями
     rx_buf: Vec<u8>,
     next_rid: u8,
 }
@@ -48,6 +41,8 @@ pub struct Phlox {
     write_ep: u8,
     read_ep: u8,
     state: Mutex<PhloxState>,
+    // гарантирует, что в каждый момент времени идёт не более одной USB-транзакции
+    usb_lock: tokio::sync::Mutex<()>,
 }
 
 unsafe impl Send for Phlox {}
@@ -82,9 +77,7 @@ fn log_configuration(device: &nusb::Device) {
 }
 
 impl Phlox {
-    /// Открывает драйвер на уже открытом устройстве `nusb::Device`.
     pub async fn open(device: nusb::Device) -> Result<Self, DeviceError> {
-
         log_configuration(&device);
 
         tracing::info!("Phlox: захватываю интерфейс {DEFAULT_INTERFACE}");
@@ -101,8 +94,6 @@ impl Phlox {
             .await
             .map_err(DeviceError::from)?;
 
-        tracing::info!("Phlox: интерфейс {DEFAULT_INTERFACE} захвачен, ищу bulk-эндпоинты");
-
         let (write_ep, read_ep) = discover_bulk_endpoints(&iface)?;
         tracing::info!("Phlox: интерфейс {DEFAULT_INTERFACE}, OUT=0x{write_ep:02X} IN=0x{read_ep:02X}");
 
@@ -111,21 +102,17 @@ impl Phlox {
             write_ep,
             read_ep,
             state: Mutex::new(PhloxState::default()),
+            usb_lock: tokio::sync::Mutex::new(()),
         })
     }
 
     async fn usb_write(&self, data: &[u8]) -> Result<(), DeviceError> {
-        tracing::info!(
-        "Phlox: usb_write: отправляю {} байт на EP=0x{:02X}: {}",
-        data.len(), self.write_ep, hex_dump(data)
-    );
         let mut ep = self
             .iface
             .endpoint::<Bulk, Out>(self.write_ep)
             .map_err(|e| DeviceError::Usb(e.to_string()))?;
         ep.submit(data.to_vec().into());
         ep.next_complete().await.into_result().map_err(DeviceError::from)?;
-        tracing::info!("Phlox: usb_write: OUT-транзакция подтверждена железом");
         Ok(())
     }
 
@@ -135,95 +122,54 @@ impl Phlox {
             .endpoint::<Bulk, In>(self.read_ep)
             .map_err(|e| DeviceError::Usb(e.to_string()))?;
         ep.submit(Buffer::new(READ_CHUNK));
-
         let data = ep.next_complete().await.into_result().map_err(DeviceError::from)?;
         Ok(data.to_vec())
     }
-    
+
     async fn read_frame(&self, deadline: Instant) -> Result<pc::Frame, DeviceError> {
-        tracing::info!("Phlox: read_frame: вход");
         loop {
             {
-                tracing::info!("Phlox: read_frame: 1");
                 let mut st = self.state.lock().unwrap();
                 if let Some((frame, consumed)) = pc::find_frame(&st.rx_buf) {
                     st.rx_buf.drain(..consumed);
-                    tracing::info!(
-                    "Phlox: read_frame: разобран кадр module_id={} data={}",
-                    frame.module_id,
-                    hex_dump(&frame.data)
-                );
                     return Ok(frame);
                 }
             }
-            tracing::info!("Phlox: read_frame: 2");
 
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                let left = self.state.lock().unwrap().rx_buf.len();
-                tracing::warn!(
-                "Phlox: read_frame: таймаут, в буфере остались непонятые {left} байт(а)"
-            );
                 return Err(DeviceError::Timeout);
             }
 
-            tracing::info!("Phlox: read_frame: 3");
             let chunk = match tokio::time::timeout(remaining, self.usb_read_chunk()).await {
                 Ok(res) => res?,
-                Err(_) => {
-                    let left = self.state.lock().unwrap().rx_buf.len();
-                    tracing::warn!(
-                    "Phlox: read_frame: таймаут ожидания данных с USB (устройство молчит), \
-                     в буфере {left} байт(а)"
-                );
-                    return Err(DeviceError::Timeout);
-                }
+                Err(_) => return Err(DeviceError::Timeout),
             };
             if chunk.is_empty() {
                 continue;
             }
-            tracing::info!(
-            "Phlox: read_frame: получено {} байт с USB: {}",
-            chunk.len(),
-            hex_dump(&chunk)
-        );
-            let mut st = self.state.lock().unwrap();
-            st.rx_buf.extend_from_slice(&chunk);
-            tracing::info!(
-            "Phlox: read_frame: буфер после накопления ({} байт): {}",
-            st.rx_buf.len(),
-            hex_dump(&st.rx_buf)
-        );
+            self.state.lock().unwrap().rx_buf.extend_from_slice(&chunk);
         }
     }
 
-
     async fn handshake(&self) -> Result<pc::DeviceInfoMsg, DeviceError> {
-
-
         let rid = {
             let mut st = self.state.lock().unwrap();
             st.next_rid = st.next_rid.wrapping_add(1);
             st.next_rid
         };
-        tracing::info!("Проверка handshake ___1");
-
 
         self.usb_write(&pc::start_frame(rid)).await?;
-
-        tracing::info!("Проверка handshake ___2");
 
         let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
         loop {
             let frame = self.read_frame(deadline).await?;
-            tracing::info!("чтение метод handshake");
             if frame.module_id != pc::MODULE_MASTER {
                 continue;
             }
             match pc::parse_device_info(&frame.data) {
                 Ok(info) if info.rid == rid => return Ok(info),
-                Ok(_) => continue,
-                Err(_) => continue,
+                _ => continue,
             }
         }
     }
@@ -242,13 +188,11 @@ fn hex_dump(data: &[u8]) -> String {
 #[async_trait]
 impl Device for Phlox {
     async fn get_version(&self) -> Result<String, DeviceError> {
+        let _guard = self.usb_lock.lock().await;
         let info = self.handshake().await?;
         tracing::info!(
             "Phlox: версия {}.{} (совместимость с {}), модулей: {}",
-            info.version,
-            info.subversion,
-            info.compat_version,
-            info.modules.len()
+            info.version, info.subversion, info.compat_version, info.modules.len()
         );
         for m in &info.modules {
             tracing::info!("Phlox: модуль id={} type={} name={:?}", m.id, m.kind, m.name);
@@ -257,6 +201,7 @@ impl Device for Phlox {
     }
 
     async fn reset(&self) -> Result<(), DeviceError> {
+        let _guard = self.usb_lock.lock().await;
         self.handshake().await?;
         Ok(())
     }
@@ -281,10 +226,9 @@ fn discover_bulk_endpoints(iface: &Interface) -> Result<(u8, u8), DeviceError> {
         }
         match ep.direction() {
             Direction::Out if out_ep.is_none() => out_ep = Some(ep.address()),
-            Direction::In if in_ep.is_none() => in_ep = Some(ep.address()),
+            Direction::In  if in_ep.is_none()  => in_ep  = Some(ep.address()),
             _ => {}
         }
-
     }
 
     match (out_ep, in_ep) {

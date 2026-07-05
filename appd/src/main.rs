@@ -4,30 +4,34 @@ mod client;
 mod session;
 mod device;
 mod transport;
+mod server;
+mod platform;
 
-use transport::Server;
+use clap::{Parser, Subcommand};
 
-const BIND_ADDR: &str = "0.0.0.0:1001";
-
-#[tokio::main]
-async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_env("APPD_LOG")
-                .add_directive("appd=info".parse().unwrap())
-                .add_directive("device_lib=info".parse().unwrap()),
-        )
-        .init();
-
-    tracing::info!("appd starting on {BIND_ADDR}");
-
-    if let Err(e) = run().await {
-        tracing::error!("fatal: {e}");
-        std::process::exit(1);
-    }
+#[derive(Parser)]
+#[command(name = "appd", about = "DaemonAppd USB/CAN service")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
 }
 
-async fn run() -> Result<(), error::AppError> {
-    let server = Server::bind(BIND_ADDR).await?;
-    server.run().await
+#[derive(Subcommand)]
+enum Commands {
+    /// Run in foreground (for debugging / manual start)
+    Run,
+    /// Register as an autostart system service
+    Install,
+    /// Remove system service registration
+    Uninstall,
+}
+
+fn main() {
+    let cli = Cli::parse();
+    match cli.command {
+        None                      => platform::run_as_service(),
+        Some(Commands::Run)       => platform::run_foreground(),
+        Some(Commands::Install)   => platform::install(),
+        Some(Commands::Uninstall) => platform::uninstall(),
+    }
 }

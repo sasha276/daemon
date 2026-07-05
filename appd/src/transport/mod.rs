@@ -162,7 +162,7 @@ async fn process(
 
     let resp: Vec<u8> = match cmd {
 
-        // ── client ────────────────────────────────────────────────────────
+        // управление клиентами
 
         Cmd::Register => {
             let id = clients.register(addr);
@@ -179,7 +179,7 @@ async fn process(
 
         Cmd::Ping => Packet::response(packet, b"pong"),
 
-        // ── devices ───────────────────────────────────────────────────────
+        // устройства
 
         Cmd::DeviceList => {
             devices.refresh().await;
@@ -221,7 +221,18 @@ async fn process(
             }
         }
 
-        // ── sessions ──────────────────────────────────────────────────────
+        Cmd::DeviceGetVersion => {
+            let idx = read_u16(&packet.payload, 0)? as usize;
+            match devices.get_driver(idx).await {
+                Ok(d) => match d.get_version().await {
+                    Ok(ver) => Packet::response(packet, ver.as_bytes()),
+                    Err(e)  => Packet::error(packet, &e.to_string()),
+                },
+                Err(e) => Packet::error(packet, &e.to_string()),
+            }
+        }
+
+        // сессии
 
         Cmd::SessionCreate => {
             let idx = read_u16(&packet.payload, 0)? as usize;
@@ -257,7 +268,7 @@ async fn process(
             Packet::response(packet, &p)
         }
 
-        // device commands
+        // команды устройства
 
         Cmd::GetVersion => {
 
@@ -287,7 +298,7 @@ async fn process(
             }
         }
 
-        // ── CAN одиночная запись ──────────────────────────────────────────
+        // запись одного CAN-кадра
 
         Cmd::CanWrite => {
             // payload: [iface:u8][id:u16 BE][data...]
@@ -307,7 +318,7 @@ async fn process(
             }
         }
 
-        // ── CAN периодическая запись ──────────────────────────────────────
+        // периодическая отправка CAN
 
         Cmd::CanPeriodicStart => {
             // payload: interval_ms:u16 + [iface:u8][id:u16 BE][data...]
@@ -358,7 +369,7 @@ async fn process(
             Packet::response(packet, &[])
         }
 
-        // ── CAN настройка скорости ────────────────────────────────────────
+        // настройка скорости CAN
 
         Cmd::CanSetBaudrate => {
             // payload: iface:u8 + baud:u16
@@ -381,7 +392,7 @@ async fn process(
             }
         }
 
-        // ── CAN одиночное чтение ──────────────────────────────────────────
+        // однократное чтение CAN
 
         Cmd::CanReadOnce => {
             // payload: iface:u8 ; ответ: count:u16 + повтор [len:u8][hex bytes]
@@ -410,7 +421,7 @@ async fn process(
             }
         }
 
-        // ── UART ──────────────────────────────────────────────────────────
+        // UART
 
         Cmd::UartConfigure => {
             // payload: mode:u8
@@ -463,7 +474,7 @@ async fn process(
             Packet::error(packet, "UART stream not yet implemented")
         }
 
-        // ── генератор ─────────────────────────────────────────────────────
+        // генератор
 
         Cmd::GenSetMode => {
             let sess = sessions.get(packet.session_id)?;
@@ -516,7 +527,7 @@ async fn process(
             }
         }
 
-        // ── CAN стрим (чтение потоком) ────────────────────────────────────
+        // CAN-стрим (непрерывное чтение)
 
         Cmd::StreamOpen => {
             // payload: client_data_port:u16  serial_number:u16
@@ -592,7 +603,7 @@ async fn process(
             Packet::response(packet, &[])
         }
 
-        // ── серверные команды (клиент не должен слать) ────────────────────
+        // серверные команды, клиент не должен присылать
 
         Cmd::CanFrame | Cmd::Event => {
             Packet::error(packet, "server-only command")

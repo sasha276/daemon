@@ -16,7 +16,7 @@
 
 use crate::error::DeviceError;
 
-// ── модули (ID кадра) ──────────────────────────────────────────────────────
+// идентификаторы модулей в кадре
 
 pub const MODULE_MASTER: u8 = 0;
 pub const MODULE_CAN1: u8 = 1;
@@ -32,12 +32,12 @@ pub const MODULE_GEN1: u8 = 10;
 pub const MODULE_GEN2: u8 = 11;
 pub const MODULE_ERROR: u8 = 128;
 
-// ── типы сообщений Master ──────────────────────────────────────────────────
+// типы сообщений модуля Master
 
 pub const MASTER_TYPE_DEVICE_INFO: u8 = 0x01;
 pub const MASTER_TYPE_START: u8 = 0x01;
 
-// ── CRC8 ────────────────────────────────────────────────────────────────────
+// CRC8
 
 /// CRC-8, poly=0x31, init=0xFF (см. протокол Phlox). `CRC8(b"123456789") == 0xF7`.
 pub fn crc8(block: &[u8]) -> u8 {
@@ -55,7 +55,7 @@ pub fn crc8(block: &[u8]) -> u8 {
     crc
 }
 
-// ── кадр ────────────────────────────────────────────────────────────────────
+// кадр протокола
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
@@ -109,7 +109,7 @@ pub fn find_frame(buf: &[u8]) -> Option<(Frame, usize)> {
     None
 }
 
-// ── Master: Start / Device Info
+// Master: Start / Device Info
 
 /// Кадр запроса "Start" в модуль Master.
 pub fn start_frame(rid: u8) -> Vec<u8> {
